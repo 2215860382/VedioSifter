@@ -1,0 +1,10 @@
+# 数据集配方：定义训练/测试用的数据集和样本量
+# TODO: 根据实际视频数据集填充
+
+datasets:
+  train:
+    # video_qa_dataset: 10000
+    placeholder: 1000
+  test:
+    # video_qa_dataset: 500
+    placeholder: 100

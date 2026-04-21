@@ -1,0 +1,12 @@
+# VedioSifter VERL / GRPO 训练配置
+
+custom_reward_function:
+  path: VedioSifter/reward/reward_score.py
+  name: compute_score
+
+reward_model:
+  reward_manager: dapo
+  overlong_buffer:
+    enable: False
+    len: 0
+    penalty_factor: 0.0

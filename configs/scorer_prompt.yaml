@@ -1,0 +1,23 @@
+scorer_prompt:
+  template: |
+    You are evaluating how helpful a video memory segment is for answering a specific question.
+
+    Question: {question}
+
+    Reference Answer: {answer}
+
+    Memory Segment:
+    {memory}
+
+    Please score how helpful this memory segment is for answering the question above.
+
+    Scoring criteria:
+    - +10: The segment directly and completely contains the information needed to answer the question.
+    - +5 to +9: The segment contains partially relevant information that helps narrow down the answer.
+    - +1 to +4: The segment is loosely related to the topic but does not help answer the question.
+    - 0: The segment is irrelevant to the question.
+    - -1 to -5: The segment is somewhat misleading or might cause confusion.
+    - -10 to -6: The segment contains information that directly contradicts or misleads the answer.
+
+    Think briefly, then output your score in the format: <score>NUMBER</score>
+    The score must be an integer between -10 and 10.
