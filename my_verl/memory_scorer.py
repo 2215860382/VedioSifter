@@ -1,17 +1,14 @@
 """
-记忆打分模块：调用大模型对记忆库中的所有片段打分（-100~100）。
-
-每条记忆只打一次分，分数直接写回 memory_db。
+记忆打分模块：调用大模型对每个 (qa_id, memory_id) 候选对打分（-100~100）。
 
 输入：
-    memory_db.parquet — memory_id, video_id, text
+    memory_db.parquet — qa_id, memory_id, video_id, text, speech_text, t_start, t_end
+                        每行是一个 (问题, 记忆片段) 候选对
     qa_db.parquet     — qa_id, video_id, question, answer
-    （假设每个 video_id 对应恰好一条 QA）
 
 输出：
-    memory_db_scored.parquet — memory_id, video_id, text,
-                               qa_id, question, answer, score
-    与原 memory_db 行数相同，增加问题字段和 score 列。
+    memory_db_scored.parquet — 原 memory_db 所有列 + question, answer, score
+                               行数与 memory_db 相同
 """
 
 import asyncio
@@ -82,23 +79,23 @@ class MemoryScorer:
 
     async def score_all(self, memory_db: pd.DataFrame, qa_db: pd.DataFrame) -> pd.DataFrame:
         """
-        对每个 QA，给该视频的所有记忆片段打分（每条只打一次）。
-        返回 memory_db 加上 qa_id/question/answer/score 列，行数不变。
+        按 qa_id 分组，对每组的所有候选记忆片段并发打分。
+        memory_db 已含 qa_id 列，每行是一个 (qa_id, memory_id) 候选对。
+        返回原 memory_db 加上 question/answer/score 列，行数不变。
         """
-        # video_id → QA 映射（假设每个视频恰好一条 QA）
-        qa_by_video: dict = {
-            row["video_id"]: row.to_dict()
+        qa_by_id: dict = {
+            row["qa_id"]: row.to_dict()
             for _, row in qa_db.iterrows()
         }
 
         result_rows = []
-        skipped_videos = []
+        skipped_qas = []
 
-        for video_id, group in memory_db.groupby("video_id"):
-            qa = qa_by_video.get(video_id)
+        for qa_id, group in memory_db.groupby("qa_id"):
+            qa = qa_by_id.get(qa_id)
             if qa is None:
-                logger.warning(f"No QA found for video {video_id}, skipping")
-                skipped_videos.append(video_id)
+                logger.warning(f"No QA found for qa_id {qa_id}, skipping")
+                skipped_qas.append(qa_id)
                 continue
 
             memories = group.to_dict("records")
@@ -109,25 +106,24 @@ class MemoryScorer:
             scores = await asyncio.gather(*tasks)
 
             if any(s is None for s in scores):
-                logger.warning(f"Scoring failed for {video_id}, skipping")
-                skipped_videos.append(video_id)
+                logger.warning(f"Scoring failed for qa_id {qa_id}, skipping")
+                skipped_qas.append(qa_id)
                 continue
 
             for mem, score in zip(memories, scores):
                 result_rows.append({
                     **mem,
-                    "qa_id":    qa["qa_id"],
                     "question": qa["question"],
                     "answer":   qa["answer"],
                     "score":    score,
                 })
 
-            logger.info(f"{video_id}: {len(memories)} memories | "
+            logger.info(f"{qa_id}: {len(memories)} memories | "
                         f"min={min(scores):.0f} max={max(scores):.0f} "
                         f"mean={sum(scores)/len(scores):.1f}")
 
-        if skipped_videos:
-            logger.warning(f"Skipped videos: {skipped_videos}")
+        if skipped_qas:
+            logger.warning(f"Skipped QAs: {skipped_qas}")
 
         return pd.DataFrame(result_rows)
 
@@ -153,10 +149,9 @@ def main():
 
     memory_db = pd.read_parquet(args.memory_db)
     qa_db = pd.read_parquet(args.qa_db)
-    logger.info(f"memory_db: {len(memory_db)} segments | qa_db: {len(qa_db)} QA pairs")
+    logger.info(f"memory_db: {len(memory_db)} candidate pairs | qa_db: {len(qa_db)} QA pairs")
     logger.info(f"Total scoring calls: {len(memory_db)} "
-                f"({memory_db['video_id'].nunique()} videos × avg "
-                f"{len(memory_db)/memory_db['video_id'].nunique():.0f} memories)")
+                f"({len(qa_db)} QA × avg {len(memory_db)/len(qa_db):.0f} candidates)")
 
     df_out = asyncio.run(scorer.score_all(memory_db, qa_db))
 
