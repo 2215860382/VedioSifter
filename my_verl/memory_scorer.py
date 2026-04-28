@@ -1,17 +1,21 @@
 """
-记忆打分模块：调用大模型对每条视频记忆片段打分（-10~10），
-并直接输出 VERL GRPO 训练格式的 parquet。
+记忆打分模块：调用大模型对记忆库中的所有片段打分（-100~100）。
 
-输入 parquet 字段：
-    question, memories (List[str]), answer
+每条记忆只打一次分，分数直接写回 memory_db。
 
-输出 parquet 字段（VERL 训练格式）：
-    prompt, reward_model, data_source
+输入：
+    memory_db.parquet — memory_id, video_id, text
+    qa_db.parquet     — qa_id, video_id, question, answer
+    （假设每个 video_id 对应恰好一条 QA）
+
+输出：
+    memory_db_scored.parquet — memory_id, video_id, text,
+                               qa_id, question, answer, score
+    与原 memory_db 行数相同，增加问题字段和 score 列。
 """
 
 import asyncio
 import os
-import re
 import yaml
 import argparse
 import pandas as pd
@@ -20,69 +24,35 @@ from loguru import logger
 from openai import AsyncOpenAI
 
 
-# ======================== Prompt 构建 ========================
-
-RANKING_SYSTEM_PROMPT = """You are a memory retrieval assistant. Given a question and a list of video memory segments, rank the segments from most to least helpful for answering the question.
-
-Output your reasoning in <think>...</think> tags, then output the ranking as a comma-separated list of 0-indexed segment numbers in <ranking>...</ranking> tags.
-
-Example output format:
-<think>Segment 2 directly mentions the answer, segment 0 is loosely related...</think>
-<ranking>2,0,1,3</ranking>"""
-
-
-def build_ranking_prompt(question: str, memories: List[str]) -> List[dict]:
-    """构建小模型重排的 chat 格式输入。"""
-    memory_text = "".join(f"[{i}] {mem}\n" for i, mem in enumerate(memories))
-    user_content = (
-        f"Question: {question}\n\n"
-        f"Memory Segments:\n{memory_text}\n"
-        f"Rank these segments from most to least helpful for answering the question."
-    )
-    return [
-        {"role": "system", "content": RANKING_SYSTEM_PROMPT},
-        {"role": "user", "content": user_content},
-    ]
-
-
-def to_verl_record(row: dict) -> dict:
-    """将打完分的一条数据转成 VERL 训练格式。"""
-    return {
-        "prompt": build_ranking_prompt(row["question"], row["memories"]),
-        "data_source": row.get("data_source", "vediosifter"),
-        "reward_model": {
-            "ground_truth": row["answer"],   # NaiveRewardManager 读 ground_truth
-        },
-        "extra_info": {
-            "memory_scores": row["memory_scores"],  # compute_score 从 extra_info 读
-        },
-    }
-
-
-# ======================== 打分逻辑 ========================
-
 def load_scorer_prompt(config_path: str) -> dict:
     with open(config_path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 
 def build_score_prompt(question: str, memory: str, answer: str, prompt_template: str) -> str:
-    return prompt_template.format(question=question, memory=memory, answer=answer)
+    return (prompt_template
+            .replace("{question}", question)
+            .replace("{memory}", memory)
+            .replace("{answer}", answer))
 
 
 def extract_score(response: str) -> Optional[float]:
-    match = re.search(r"<score>\s*(-?\d+(?:\.\d+)?)\s*</score>", response)
-    if match:
-        return max(-10.0, min(10.0, float(match.group(1))))
-    numbers = re.findall(r"-?\d+(?:\.\d+)?", response)
-    if numbers:
-        return max(-10.0, min(10.0, float(numbers[-1])))
-    return None
+    import json
+    try:
+        start = response.find("{")
+        end = response.rfind("}") + 1
+        if start == -1 or end == 0:
+            return None
+        data = json.loads(response[start:end])
+        score = float(data["final_score"])
+        return float(max(-100, min(100, int(score))))
+    except Exception:
+        return None
 
 
 class MemoryScorer:
     def __init__(self, api_url: str, model_name: str, prompt_template: str,
-                 max_concurrent: int = 32, temperature: float = 0.0, max_tokens: int = 256):
+                 max_concurrent: int = 32, temperature: float = 0.0, max_tokens: int = 512):
         self.model_name = model_name
         self.prompt_template = prompt_template
         self.temperature = temperature
@@ -90,7 +60,7 @@ class MemoryScorer:
         self.semaphore = asyncio.Semaphore(max_concurrent)
         self.client = AsyncOpenAI(base_url=api_url, api_key=os.getenv("API_KEY", "EMPTY"))
 
-    async def score_single(self, question: str, memory: str, answer: str) -> float:
+    async def score_single(self, question: str, memory: str, answer: str) -> Optional[float]:
         prompt = build_score_prompt(question, memory, answer, self.prompt_template)
         async with self.semaphore:
             for attempt in range(3):
@@ -104,36 +74,73 @@ class MemoryScorer:
                     score = extract_score(resp.choices[0].message.content)
                     if score is not None:
                         return score
+                    logger.warning(f"Score parse failed (attempt {attempt+1}): {resp.choices[0].message.content[:80]}")
                 except Exception as e:
                     logger.warning(f"API error (attempt {attempt+1}): {e}")
                     await asyncio.sleep(1 * (attempt + 1))
-        return 0.0
+        return None
 
-    async def score_row(self, row: dict) -> List[float]:
-        tasks = [self.score_single(row["question"], mem, row["answer"]) for mem in row["memories"]]
-        return list(await asyncio.gather(*tasks))
+    async def score_all(self, memory_db: pd.DataFrame, qa_db: pd.DataFrame) -> pd.DataFrame:
+        """
+        对每个 QA，给该视频的所有记忆片段打分（每条只打一次）。
+        返回 memory_db 加上 qa_id/question/answer/score 列，行数不变。
+        """
+        # video_id → QA 映射（假设每个视频恰好一条 QA）
+        qa_by_video: dict = {
+            row["video_id"]: row.to_dict()
+            for _, row in qa_db.iterrows()
+        }
 
-    async def score_and_convert(self, df: pd.DataFrame) -> pd.DataFrame:
-        """打分，并直接转成 VERL 训练格式。"""
-        records = []
-        for _, row in df.iterrows():
-            row = row.to_dict()
-            row["memory_scores"] = await self.score_row(row)
-            records.append(to_verl_record(row))
-        return pd.DataFrame(records)
+        result_rows = []
+        skipped_videos = []
 
+        for video_id, group in memory_db.groupby("video_id"):
+            qa = qa_by_video.get(video_id)
+            if qa is None:
+                logger.warning(f"No QA found for video {video_id}, skipping")
+                skipped_videos.append(video_id)
+                continue
 
-# ======================== 入口 ========================
+            memories = group.to_dict("records")
+            tasks = [
+                self.score_single(qa["question"], m["text"], qa["answer"])
+                for m in memories
+            ]
+            scores = await asyncio.gather(*tasks)
+
+            if any(s is None for s in scores):
+                logger.warning(f"Scoring failed for {video_id}, skipping")
+                skipped_videos.append(video_id)
+                continue
+
+            for mem, score in zip(memories, scores):
+                result_rows.append({
+                    **mem,
+                    "qa_id":    qa["qa_id"],
+                    "question": qa["question"],
+                    "answer":   qa["answer"],
+                    "score":    score,
+                })
+
+            logger.info(f"{video_id}: {len(memories)} memories | "
+                        f"min={min(scores):.0f} max={max(scores):.0f} "
+                        f"mean={sum(scores)/len(scores):.1f}")
+
+        if skipped_videos:
+            logger.warning(f"Skipped videos: {skipped_videos}")
+
+        return pd.DataFrame(result_rows)
+
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--input_file", required=True)
-    parser.add_argument("--output_dir", required=True)
+    parser.add_argument("--memory_db", required=True)
+    parser.add_argument("--qa_db", required=True)
+    parser.add_argument("--output_file", required=True, help="memory_db_scored.parquet")
     parser.add_argument("--model_name", required=True)
     parser.add_argument("--api_url", default="http://localhost:8000/v1")
     parser.add_argument("--prompt_config", default="configs/scorer_prompt.yaml")
     parser.add_argument("--max_concurrent", type=int, default=32)
-    parser.add_argument("--train_ratio", type=float, default=0.9)
     args = parser.parse_args()
 
     prompt_template = load_scorer_prompt(args.prompt_config)["scorer_prompt"]["template"]
@@ -144,16 +151,18 @@ def main():
         max_concurrent=args.max_concurrent,
     )
 
-    df = pd.read_parquet(args.input_file)
-    logger.info(f"Loaded {len(df)} rows")
+    memory_db = pd.read_parquet(args.memory_db)
+    qa_db = pd.read_parquet(args.qa_db)
+    logger.info(f"memory_db: {len(memory_db)} segments | qa_db: {len(qa_db)} QA pairs")
+    logger.info(f"Total scoring calls: {len(memory_db)} "
+                f"({memory_db['video_id'].nunique()} videos × avg "
+                f"{len(memory_db)/memory_db['video_id'].nunique():.0f} memories)")
 
-    df_out = asyncio.run(scorer.score_and_convert(df))
+    df_out = asyncio.run(scorer.score_all(memory_db, qa_db))
 
-    os.makedirs(args.output_dir, exist_ok=True)
-    n_train = int(len(df_out) * args.train_ratio)
-    df_out.iloc[:n_train].to_parquet(os.path.join(args.output_dir, "train_0.parquet"), index=False)
-    df_out.iloc[n_train:].to_parquet(os.path.join(args.output_dir, "test.parquet"), index=False)
-    logger.info(f"Saved {n_train} train + {len(df_out)-n_train} test to {args.output_dir}")
+    os.makedirs(os.path.dirname(os.path.abspath(args.output_file)), exist_ok=True)
+    df_out.to_parquet(args.output_file, index=False)
+    logger.info(f"Saved {len(df_out)} scored memories → {args.output_file}")
 
 
 if __name__ == "__main__":

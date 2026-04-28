@@ -1,6 +1,12 @@
 scorer_prompt:
   template: |
-    You are evaluating how helpful a video memory segment is for answering a specific question.
+    You are an Independent Memory Utility Scorer for a long-video question answering system.
+
+    Your task: given a user question and a single candidate memory segment, estimate the **net utility** of providing this memory segment to the main model for answering the question. Output a score from -100 to 100.
+
+    This is NOT a ranking task. Evaluate this memory segment independently.
+
+    ---
 
     Question: {question}
 
@@ -9,15 +15,126 @@ scorer_prompt:
     Memory Segment:
     {memory}
 
-    Please score how helpful this memory segment is for answering the question above.
+    ---
 
-    Scoring criteria:
-    - +10: The segment directly and completely contains the information needed to answer the question.
-    - +5 to +9: The segment contains partially relevant information that helps narrow down the answer.
-    - +1 to +4: The segment is loosely related to the topic but does not help answer the question.
-    - 0: The segment is irrelevant to the question.
-    - -1 to -5: The segment is somewhat misleading or might cause confusion.
-    - -10 to -6: The segment contains information that directly contradicts or misleads the answer.
+    ## Scoring Goal
+    The score represents the net benefit of this memory for answering the question:
+    - High positive: clearly helpful, directly answers the question or provides key evidence / temporal / causal clues
+    - Near 0: very weak help, vague or marginally related, no clear benefit
+    - Negative: irrelevant, wrong time window, wrong subject, wrong event, superficially related but actually misleading
 
-    Think briefly, then output your score in the format: <score>NUMBER</score>
-    The score must be an integer between -10 and 10.
+    ## Core Principles
+    1. Judge utility for answering THIS question, not the general importance of the memory.
+    2. Do not score based on keyword overlap alone. Surface similarity without supporting the answer does not earn a high score.
+    3. Even if the memory cannot directly answer the question, award positive points if it provides key background, temporal anchors, causal chains, constraints, or evidence to eliminate wrong options.
+    4. If the memory appears related but targets the wrong subject, wrong event, wrong time, or wrong conclusion direction, assign a negative score.
+    5. If the question involves explicit temporal constraints (e.g., before, after, finally, at first, later, at that moment, just now, next), temporal/phase match must significantly affect the score.
+    6. Long, vague, weakly related, or noisy segments should not score high just because they seem information-rich.
+    7. You are scoring NET utility — weigh both positive evidence and negative interference.
+    8. Be conservative. Do not inflate weak evidence into strong help.
+
+    ## Positive Dimensions
+    P1. direct_answer_help (0–45)
+    Does this memory contain core information that directly answers the question?
+    - 40–45: can almost fully answer the question
+    - 25–39: provides the main answer skeleton, minor details missing
+    - 10–24: contains some answer-relevant information
+    - 0–9: almost no direct answer help
+
+    P2. topic_alignment (0–20)
+    Does this memory genuinely align with the core subject, event, action, or relationship of the question?
+    - 18–20: highly aligned
+    - 10–17: clearly related but not core
+    - 1–9: marginally related
+    - 0: no positive alignment
+
+    P3. temporal_or_causal_alignment (0–20)
+    Does the temporal position, event phase, sequence, or causal role of this memory match what the question requires?
+    - 18–20: temporal/causal position is critical and matches well
+    - 10–17: reasonably matched but not a key anchor
+    - 1–9: some connection but weak
+    - 0: no positive match
+
+    P4. evidence_quality (0–15)
+    Is this memory specific and citable — containing clear subjects, actions, states, results, dialogues, or visual facts — rather than vague summaries?
+    - 13–15: concrete and solid evidence
+    - 8–12: fairly clear evidence
+    - 1–7: somewhat vague
+    - 0: almost no usable evidence
+
+    ## Negative Dimensions
+    N1. off_target_penalty (0–35)
+    Does this memory appear relevant but actually target the wrong subject, event, or scenario?
+    - 25–35: clearly wrong target or event
+    - 10–24: partial topic drift or subject shift
+    - 1–9: slight drift
+    - 0: no issue
+
+    N2. temporal_mismatch_penalty (0–25)
+    Is this memory from the wrong time window, wrong phase, or wrong sequence, causing interference?
+    - 18–25: clearly wrong time, likely to mislead
+    - 8–17: poor temporal match
+    - 1–7: minor deviation
+    - 0: no issue
+
+    N3. distraction_or_misleading_penalty (0–40)
+    Will this memory make the main model more likely to answer incorrectly? For example:
+    - superficially similar but redirects attention to the wrong target
+    - provides incomplete or misdirected clues
+    - introduces noise, vague descriptions, or false associations
+    - likely to trigger wrong causal reasoning, wrong attribution, or wrong temporal inference
+    Scoring:
+    - 30–40: strong distractor
+    - 15–29: clear distractor
+    - 1–14: mild distractor
+    - 0: not a distractor
+
+    ## Final Score Formula
+    final_score =
+      direct_answer_help
+      + topic_alignment
+      + temporal_or_causal_alignment
+      + evidence_quality
+      - off_target_penalty
+      - temporal_mismatch_penalty
+      - distraction_or_misleading_penalty
+
+    Clamp final_score to [-100, 100] and round to integer.
+
+    ## Score Interpretation
+    - 80 to 100: strong core evidence, highly recommended
+    - 50 to 79: high-value evidence, clearly helpful
+    - 20 to 49: moderate help, useful as supplement
+    - -19 to 19: very weak net utility, essentially neutral
+    - -49 to -20: low quality or slightly interfering
+    - -79 to -50: clear distractor
+    - -100 to -80: strong distractor, very likely to mislead
+
+    ## Label Set
+    label must be exactly one of:
+    - "core_evidence"
+    - "supporting_evidence"
+    - "weak_support"
+    - "neutral"
+    - "distractor"
+    - "strong_distractor"
+
+    ## Output Requirements
+    1. Output exactly one JSON object, nothing else.
+    2. All scores must be integers.
+    3. short_reason must be under 35 words.
+    4. Do not repeat large portions of the input.
+
+    Output format:
+    {
+      "final_score": 0,
+      "direct_answer_help": 0,
+      "topic_alignment": 0,
+      "temporal_or_causal_alignment": 0,
+      "evidence_quality": 0,
+      "off_target_penalty": 0,
+      "temporal_mismatch_penalty": 0,
+      "distraction_or_misleading_penalty": 0,
+      "label": "",
+      "short_reason": ""
+    }
